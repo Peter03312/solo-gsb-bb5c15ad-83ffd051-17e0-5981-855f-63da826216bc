@@ -39,15 +39,16 @@ def show(title: str, status: int, resp: dict, *keys: str) -> None:
 
 
 def main() -> None:
-    # 每次运行使用独立编号，脚本可任意重复执行
+    # 每次运行使用独立编号（含采集人姓名，人员别名全局唯一），脚本可任意重复执行
     run_id = uuid.uuid4().hex[:8]
     code = f"API-DEMO-{run_id}"
+    collector = f"王采集-{run_id}"
 
     # 1) 样本登记：采集时间、采集人（初始保管人）、封签号
     s, r = call("POST", "/samples", {
         "sample_code": code,
         "collected_at": "2026-09-30T01:00:00Z",
-        "collector": "王采集",
+        "collector": collector,
         "seal_no": "SEAL-DEMO-1",
     })
     show("样本登记", s, r, "evaluation")
@@ -56,7 +57,7 @@ def main() -> None:
     s, r = call("POST", "/events", {
         "event_id": f"API-EVT-T1-{run_id}", "event_type": "transfer", "sample_code": code,
         "occurred_at": "2026-09-30T02:00:00Z",
-        "transfer_no": "TR-DEMO-1", "from_custodian": "王采集", "to_custodian": "李运输",
+        "transfer_no": "TR-DEMO-1", "from_custodian": collector, "to_custodian": "李运输",
     })
     show("移交（签收前=待补证）", s, r, "evaluation")
 
@@ -88,7 +89,7 @@ def main() -> None:
     s, r = call("POST", "/events", {
         "event_id": f"API-EVT-T1-{run_id}", "event_type": "transfer", "sample_code": code,
         "occurred_at": "2026-09-30T02:00:00Z",
-        "transfer_no": "TR-DEMO-1", "from_custodian": "王采集", "to_custodian": "李运输",
+        "transfer_no": "TR-DEMO-1", "from_custodian": collector, "to_custodian": "李运输",
     })
     show("同事件号同内容重试（幂等）", s, r, "idempotent")
 
@@ -96,7 +97,7 @@ def main() -> None:
     s, r = call("POST", "/events", {
         "event_id": f"API-EVT-T1-{run_id}", "event_type": "transfer", "sample_code": code,
         "occurred_at": "2026-09-30T02:30:00Z",  # 时间被改动
-        "transfer_no": "TR-DEMO-1", "from_custodian": "王采集", "to_custodian": "李运输",
+        "transfer_no": "TR-DEMO-1", "from_custodian": collector, "to_custodian": "李运输",
     })
     show("同事件号异内容（冲突）", s, r)
 
@@ -180,13 +181,13 @@ def main() -> None:
     call("POST", "/samples", {
         "sample_code": code2,
         "collected_at": "2026-09-30T01:00:00Z",
-        "collector": "王采集",
+        "collector": collector,
         "seal_no": "SEAL-DEMO-2",
     })
     call("POST", "/events", {
         "event_id": f"API-EVT2-T1-{run_id}", "event_type": "transfer", "sample_code": code2,
         "occurred_at": "2026-09-30T02:00:00Z",
-        "transfer_no": "TR-DEMO-2", "from_custodian": "王采集", "to_custodian": "李运输",
+        "transfer_no": "TR-DEMO-2", "from_custodian": collector, "to_custodian": "李运输",
     })
     call("POST", "/events", {
         "event_id": f"API-EVT2-R1-{run_id}", "event_type": "receive", "sample_code": code2,
@@ -212,14 +213,14 @@ def main() -> None:
         call("POST", "/samples", {
             "sample_code": bc,
             "collected_at": "2026-09-30T01:00:00Z",
-            "collector": "王采集",
+            "collector": collector,
             "seal_no": f"SEAL-BATCH-{run_b}-{i}",
         })
 
     batch_body = {
         "batch_id": f"API-BATCH-{run_b}",
         "occurred_at": "2026-09-30T02:00:00Z",
-        "from_custodian": "王采集",
+        "from_custodian": collector,
         "to_custodian": "李运输",
         "items": [
             {"sample_code": b_codes[0], "transfer_no": f"TR-B-{run_b}-1",
@@ -251,7 +252,7 @@ def main() -> None:
     bad2 = {
         "batch_id": f"API-BATCH-BAD-{run_b}",
         "occurred_at": "2026-09-30T02:00:00Z",
-        "from_custodian": "王采集", "to_custodian": "李运输",
+        "from_custodian": collector, "to_custodian": "李运输",
         "items": [
             {"sample_code": b_codes[0], "transfer_no": "TR-X1",
              "event_id": f"API-BEVT-{run_b}-9"},
@@ -290,13 +291,13 @@ def main() -> None:
         call("POST", "/samples", {
             "sample_code": rc,
             "collected_at": "2026-09-30T01:00:00Z",
-            "collector": "王采集",
+            "collector": collector,
             "seal_no": rc.replace("API-RECON-", "SEAL-RECON-"),
         })
     recon_batch = {
         "batch_id": f"API-RECON-BATCH-{run_r}",
         "occurred_at": "2026-09-30T02:00:00Z",
-        "from_custodian": "王采集",
+        "from_custodian": collector,
         "to_custodian": "李运输",
         "items": [
             {"sample_code": r_codes[0], "transfer_no": f"TR-R-{run_r}-1",
@@ -356,11 +357,11 @@ def main() -> None:
     for x in rc2:
         call("POST", "/samples", {
             "sample_code": x, "collected_at": "2026-09-30T01:00:00Z",
-            "collector": "王采集", "seal_no": x.replace("API-RECON-", "SEAL-RECON-")})
+            "collector": collector, "seal_no": x.replace("API-RECON-", "SEAL-RECON-")})
     call("POST", "/transfer-batches", {
         "batch_id": f"API-RECON-BATCH-{run_r2}",
         "occurred_at": "2026-09-30T02:00:00Z",
-        "from_custodian": "王采集", "to_custodian": "李运输",
+        "from_custodian": collector, "to_custodian": "李运输",
         "items": [
             {"sample_code": rc2[0], "transfer_no": f"TR-{run_r2}-1", "event_id": f"API-REVT-{run_r2}-1"},
             {"sample_code": rc2[1], "transfer_no": f"TR-{run_r2}-2", "event_id": f"API-REVT-{run_r2}-2"}]})
@@ -439,7 +440,7 @@ def main() -> None:
     call("POST", "/events", {
         "event_id": f"API-EVT2-T2-{run_id}", "event_type": "transfer", "sample_code": code2,
         "occurred_at": "2026-09-30T06:00:00Z",
-        "transfer_no": "TR-DEMO-2B", "from_custodian": "王采集", "to_custodian": "李运输",
+        "transfer_no": "TR-DEMO-2B", "from_custodian": collector, "to_custodian": "李运输",
     })
     s, r = call("POST", "/dossiers", dossier_body)
     print(f"\n--- 同案卷号同请求重试（样本已新增版本）[HTTP {s}] 幂等={r.get('idempotent')} ---")
@@ -561,16 +562,16 @@ def main() -> None:
     print("\n=== 人员标识与复核回避 ===")
     # 16.1) 登记人员标识：全局唯一主标识 + 可选初始历史别名
     qc_a = f"QC-A-{run_id}"
-    s, r = call("POST", "/persons", {"person_id": qc_a, "aliases": ["王采集"]})
+    s, r = call("POST", "/persons", {"person_id": qc_a, "aliases": [collector]})
     show("登记人员（主标识 + 初始别名）", s, r, "person")
     revision = r["person"]["revision"]
 
     # 16.2) 增补历史别名：须携带所见修订号（GET 人员取得）；过期则拒绝
     s, r = call("POST", f"/persons/{qc_a}/aliases",
-                {"alias": "采集老王", "expected_revision": revision})
+                {"alias": f"采集老王-{run_id}", "expected_revision": revision})
     print(f"增补别名（携带修订号 {revision}）[HTTP {s}] 新修订号={r['person']['revision']}")
     s, r = call("POST", f"/persons/{qc_a}/aliases",
-                {"alias": "老王", "expected_revision": revision})  # 修订号已过期
+                {"alias": f"老王-{run_id}", "expected_revision": revision})  # 修订号已过期
     print("过期修订号增补:", s, r.get("error", {}).get("code"),
           "| 当前修订号:", r.get("error", {}).get("details", {}).get("current_revision"))
 
@@ -578,11 +579,11 @@ def main() -> None:
     qc_b = f"QC-B-{run_id}"
     call("POST", "/persons", {"person_id": qc_b})
     s, r = call("POST", f"/persons/{qc_b}/aliases",
-                {"alias": "王采集", "expected_revision": 1})
+                {"alias": collector, "expected_revision": 1})
     print("别名归属他人:", s, r.get("error", {}).get("code"),
           "| 归属:", r.get("error", {}).get("details", {}).get("owner_person_id"))
 
-    # 16.4) 另封存一卷演示回避：code/code2 的采集人、移交人均为“王采集”，code 的核定人为“质量主管”
+    # 16.4) 另封存一卷演示回避：code/code2 的采集人、移交人均为 collector（王采集-{run_id}），code 的核定人为“质量主管”
     recusal_dossier_id = f"API-RECUSAL-DOS-{run_id}"
     s, r = call("POST", "/dossiers", {
         "dossier_id": recusal_dossier_id,
@@ -591,7 +592,7 @@ def main() -> None:
     digest2 = r["dossier"]["digest"]
     print(f"\n--- 回避演示案卷封存 [HTTP {s}] 摘要={digest2} ---")
 
-    # 复核人 QC-A 的别名“王采集”是封存版本的采集人/移交人 → 整单拒绝并列出份项与命中角色
+    # 复核人 QC-A 的别名（=collector）是封存版本的采集人/移交人 → 整单拒绝并列出份项与命中角色
     s, r = call("POST", f"/dossiers/{recusal_dossier_id}/reviews", {
         "review_no": f"API-RV-REC-{run_id}", "reviewer": qc_a,
         "expected_digest": digest2,
@@ -636,6 +637,106 @@ def main() -> None:
     s, r = call("GET", f"/persons/{qc_a}")
     print(f"\n--- 人员查询 [HTTP {s}] ---")
     print(json.dumps(r["person"], ensure_ascii=False, indent=2))
+
+    # 17) 运输测温证据：一次性配置 → 读数记录 → 超温点/缺测区间复核（归属随链重算）
+    print("\n=== 运输测温证据复核 ===")
+    # 17.1) 独立样本：采集 → 移交（在途）→ 签收，运输途中测温
+    tcode = f"API-TEMP-{run_id}"
+    call("POST", "/samples", {
+        "sample_code": tcode, "collected_at": "2026-09-30T01:00:00Z",
+        "collector": collector, "seal_no": "SEAL-TEMP-1",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-TEVT-T1-{run_id}", "event_type": "transfer", "sample_code": tcode,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": "TR-TEMP-1", "from_custodian": collector, "to_custodian": "李运输",
+    })
+    call("POST", "/events", {
+        "event_id": f"API-TEVT-R1-{run_id}", "event_type": "receive", "sample_code": tcode,
+        "occurred_at": "2026-09-30T04:00:00Z",
+        "transfer_no": "TR-TEMP-1", "receiver": "李运输", "seal_no": "SEAL-TEMP-1",
+    })
+
+    # 17.2) 一次性设定测温配置：允许 2~8℃（闭区间）、最大测温间隔 30 分钟
+    s, r = call("POST", "/temperature-configs", {
+        "sample_code": tcode, "min_celsius": 2.0, "max_celsius": 8.0, "max_interval_seconds": 1800,
+    })
+    show("测温配置（201 一次性设定）", s, r, "config")
+    s, r = call("POST", "/temperature-configs", {
+        "sample_code": tcode, "min_celsius": 2.0, "max_celsius": 8.0, "max_interval_seconds": 1800,
+    })
+    show("同内容配置重试（200 幂等）", s, r, "idempotent")
+    s, r = call("POST", "/temperature-configs", {
+        "sample_code": tcode, "min_celsius": 2.0, "max_celsius": 9.0, "max_interval_seconds": 1800,
+    })
+    print("异内容配置:", s, r.get("error", {}).get("code"))
+
+    # 17.3) 记录读数（故意乱序；含超温点与缺测区间）
+    for rid, when, value in [
+        ("RD-2", "2026-09-30T02:30:00Z", 5.0),
+        ("RD-1", "2026-09-30T01:30:00Z", 4.2),
+        ("RD-3", "2026-09-30T03:40:00Z", 9.6),   # 超温（在途）
+        ("RD-4", "2026-09-30T04:30:00Z", 6.5),
+    ]:
+        s, r = call("POST", "/temperature-readings", {
+            "sample_code": tcode, "reading_id": f"API-{rid}-{run_id}",
+            "device_id": "DEV-COLD-01", "occurred_at": when, "value_celsius": value,
+        })
+        print(f"  读数 {rid} {when} {value}℃ [HTTP {s}]")
+    # 同号同内容重试返回原记录；同号异内容 / 重复发生时刻 / 采集前 拒绝
+    s, r = call("POST", "/temperature-readings", {
+        "sample_code": tcode, "reading_id": f"API-RD-1-{run_id}",
+        "device_id": "DEV-COLD-01", "occurred_at": "2026-09-30T01:30:00Z", "value_celsius": 4.2,
+    })
+    show("同读数号同内容重试（200 返回原记录）", s, r, "idempotent")
+    s, r = call("POST", "/temperature-readings", {
+        "sample_code": tcode, "reading_id": f"API-RD-1-{run_id}",
+        "device_id": "DEV-COLD-01", "occurred_at": "2026-09-30T01:30:00Z", "value_celsius": 7.7,
+    })
+    print("同读数号异内容:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", "/temperature-readings", {
+        "sample_code": tcode, "reading_id": f"API-RD-9-{run_id}",
+        "device_id": "DEV-COLD-01", "occurred_at": "2026-09-30T01:30:00Z", "value_celsius": 7.7,
+    })
+    print("重复发生时刻:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", "/temperature-readings", {
+        "sample_code": tcode, "reading_id": f"API-RD-8-{run_id}",
+        "device_id": "DEV-COLD-01", "occurred_at": "2026-09-30T00:30:00Z", "value_celsius": 7.7,
+    })
+    print("采集前发生时刻:", s, r.get("error", {}).get("code"))
+
+    # 17.4) 复核查询：超温点 + 缺测区间（跨移交/签收时刻拆分，逐段标明归属）
+    s, r = call("GET", f"/samples/{tcode}/temperature")
+    print(f"\n--- 测温证据复核 [HTTP {s}] ---")
+    print("配置:", r["config"]["min_celsius"], "~", r["config"]["max_celsius"],
+          "℃ | 最大间隔", r["config"]["max_interval_seconds"], "秒 | 读数", r["reading_count"], "条")
+    for p in r["out_of_range_points"]:
+        a = p["attribution"]
+        who = a.get("custodian") or (f"在途 {a.get('transfer_no')}" if a["kind"] == "in_transit" else "待核")
+        print(f"  超温点 {p['reading_id']} {p['occurred_at']} {p['value_celsius']}℃"
+              f"（{p['direction']} 限值 {p['limit_celsius']}℃）归属: {who}")
+    for g in r["gap_intervals"]:
+        print(f"  缺测区间 {g['start']} → {g['end']}（{g['duration_seconds']}秒"
+              f" > 限值 {g['max_interval_seconds']}秒）")
+        for seg in g["segments"]:
+            a = seg["attribution"]
+            who = a.get("custodian") or (f"在途 {a.get('transfer_no')} {a.get('from_custodian')}→{a.get('to_custodian')}"
+                                         if a["kind"] == "in_transit" else "待核")
+            print(f"    段 {seg['start']} → {seg['end']}（{seg['duration_seconds']}秒）归属: {who}")
+
+    # 17.5) 签收作废纠错后归属即时重算（原读数不改）：04:30 读数归属回到在途
+    s, r = call("POST", "/corrections", {
+        "correction_id": f"API-TFIX-{run_id}", "sample_code": tcode,
+        "target_event_id": f"API-TEVT-R1-{run_id}", "action": "void",
+        "operator": "质控员", "reason": "示例：签收记录作废，演示归属重算",
+    })
+    print("\n签收作废纠错:", s, "| 链结论:", r["evaluation"]["status"])
+    s, r = call("GET", f"/samples/{tcode}/temperature")
+    for g in r["gap_intervals"]:
+        for seg in g["segments"]:
+            a = seg["attribution"]
+            who = a.get("custodian") or (f"在途 {a.get('transfer_no')}" if a["kind"] == "in_transit" else "待核")
+            print(f"  重算后段 {seg['start']} → {seg['end']} 归属: {who}")
 
 
 if __name__ == "__main__":

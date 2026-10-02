@@ -6,8 +6,9 @@
 from datetime import datetime, timedelta, timezone
 
 from .db import db_session, init_db
-from .schemas import EventIn, SampleIn
+from .schemas import EventIn, SampleIn, TempConfigIn, TempReadingIn
 from .service import create_event, register_sample
+from .temperature import create_temp_reading, set_temp_config
 
 
 def _iso(dt: datetime) -> datetime:
@@ -63,6 +64,8 @@ def seed_demo() -> dict[str, int]:
 
     inserted_samples = 0
     inserted_events = 0
+    inserted_configs = 0
+    inserted_readings = 0
     with db_session(immediate=True) as conn:
         for s in samples:
             _, idempotent = register_sample(conn, s)
@@ -71,10 +74,36 @@ def seed_demo() -> dict[str, int]:
             _, idempotent = create_event(conn, e)
             inserted_events += int(not idempotent)
 
-    print(f"[seed] 样本新增 {inserted_samples} 条，事件新增 {inserted_events} 条")
+        # PENDING-002 运输途中测温演示：允许 2~8℃、最大间隔 30 分钟；
+        # 读数故意乱序写入，含一个超温点与一段跨移交时刻的缺测区间（演示自动拆分与归属标注）
+        _, idempotent = set_temp_config(conn, TempConfigIn(
+            sample_code="DEMO-PENDING-002", min_celsius=2.0, max_celsius=8.0,
+            max_interval_seconds=1800))
+        inserted_configs += int(not idempotent)
+        demo_readings = [
+            TempReadingIn(sample_code="DEMO-PENDING-002", reading_id="DEMO-RD-P3",
+                          device_id="DEV-COLD-01", occurred_at=_iso(t0 - timedelta(minutes=90)),
+                          value_celsius=9.3),   # 超温（在途）
+            TempReadingIn(sample_code="DEMO-PENDING-002", reading_id="DEMO-RD-P1",
+                          device_id="DEV-COLD-01", occurred_at=_iso(t0 - timedelta(hours=3, minutes=30)),
+                          value_celsius=4.2),
+            TempReadingIn(sample_code="DEMO-PENDING-002", reading_id="DEMO-RD-P4",
+                          device_id="DEV-COLD-01", occurred_at=_iso(t0 - timedelta(minutes=60)),
+                          value_celsius=6.8),
+            TempReadingIn(sample_code="DEMO-PENDING-002", reading_id="DEMO-RD-P2",
+                          device_id="DEV-COLD-01", occurred_at=_iso(t0 - timedelta(hours=3)),
+                          value_celsius=5.1),
+        ]
+        for rd in demo_readings:
+            _, idempotent = create_temp_reading(conn, rd)
+            inserted_readings += int(not idempotent)
+
+    print(f"[seed] 样本新增 {inserted_samples} 条，事件新增 {inserted_events} 条，"
+          f"测温配置新增 {inserted_configs} 条，测温读数新增 {inserted_readings} 条")
     if inserted_samples:
-        print("[seed] 演示编号: DEMO-VALID-001(有效) / DEMO-PENDING-002(待补证) / DEMO-INVALID-003(无效)")
-    return {"samples": inserted_samples, "events": inserted_events}
+        print("[seed] 演示编号: DEMO-VALID-001(有效) / DEMO-PENDING-002(待补证，含运输测温演示) / DEMO-INVALID-003(无效)")
+    return {"samples": inserted_samples, "events": inserted_events,
+            "temp_configs": inserted_configs, "temp_readings": inserted_readings}
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 """FastAPI 应用：样本交接链核验 HTTP API。"""
 import json
+import math
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import config
@@ -22,6 +25,8 @@ from .schemas import (
     PersonIn,
     ReviewIn,
     SampleIn,
+    TempConfigIn,
+    TempReadingIn,
     TransferBatchIn,
 )
 from .service import (
@@ -37,6 +42,7 @@ from .service import (
     submit_correction,
     submit_transfer_batch,
 )
+from .temperature import create_temp_reading, get_temperature_review, set_temp_config
 from .versions import get_version, latest_version_no, list_versions, parse_version
 
 API_PREFIX = "/api/v1"
@@ -58,8 +64,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="样本交接链核验服务",
-    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核与人员标识复核回避",
-    version="1.7.0",
+    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避与运输测温证据复核",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -67,6 +73,23 @@ app = FastAPI(
 @app.exception_handler(DomainError)
 async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}})
+
+
+def _sanitize_non_finite(obj: Any) -> Any:
+    """校验错误明细中的非有限浮点（NaN/Infinity）转为字符串，保证 422 响应可序列化。"""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return repr(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_non_finite(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # 与 FastAPI 默认形态一致（{"detail": [...]}），仅净化非有限浮点输入值
+    return JSONResponse(status_code=422, content={"detail": _sanitize_non_finite(jsonable_encoder(exc.errors()))})
 
 
 def _summary(result: dict[str, Any], sample: dict[str, Any], conn=None) -> dict[str, Any]:
@@ -292,6 +315,49 @@ def approve_api(sample_code: str, data: ApproveIn) -> dict[str, Any]:
         result = approve_storage(conn, sample_code, data)
         sample = get_sample_or_404(conn, sample_code)
         return {"evaluation": _summary(result, dict(sample), conn), "approval": result["approval"]}
+
+
+# --------------------------------------------------------------------------- 运输测温证据（未核定样本）
+
+@app.post(f"{API_PREFIX}/temperature-configs", tags=["temperature"], status_code=201)
+def set_temp_config_api(data: TempConfigIn) -> JSONResponse:
+    """一次性设定运输测温配置（允许摄氏温度闭区间 + 正数最大测温间隔）。
+
+    * 每份未核定样本至多设定一次：同内容重试 → 200 幂等，异内容 → 409 temp_config_conflict；
+    * 核定入库后拒绝新配置（409 history_locked），同内容重试仍幂等返回；
+    * 配置不参与保管链核验结论、不产生保管链版本。
+    """
+    with db_session(immediate=True) as conn:
+        config, idempotent = set_temp_config(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"config": config, "idempotent": idempotent})
+
+
+@app.post(f"{API_PREFIX}/temperature-readings", tags=["temperature"], status_code=201)
+def create_temp_reading_api(data: TempReadingIn) -> JSONResponse:
+    """按全局唯一读数号记录测温读数（设备号、发生时间、有限数值）。
+
+    * 须先完成测温配置（否则 409 temp_config_missing）；发生时间早于采集 → 422；
+    * 同一样本同一发生时刻只允许一条读数（重复 → 409 reading_time_duplicate）；
+    * 同读数号同内容重试 → 200 返回原记录；异内容 → 409 reading_conflict；
+    * 核定后拒绝新读数（409 history_locked）；读数不产生保管链版本。
+    """
+    with db_session(immediate=True) as conn:
+        reading, idempotent = create_temp_reading(conn, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"reading": reading, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature", tags=["temperature"])
+def get_temperature_review_api(sample_code: str) -> dict[str, Any]:
+    """测温证据复核：按发生时间列出超温点与缺测区间（跨移交/签收时刻拆分）。
+
+    每段依当前有效保管链标明当时保管人（custodian）或在途移交（in_transit）；
+    断链导致归属不能确定时标为待核（pending_review）；乱序补录与移交/签收纠错后
+    再次查询即按最新有效链重算归属。未设定测温配置 → 404 temp_config_not_found。
+    """
+    with db_session() as conn:
+        return get_temperature_review(conn, sample_code)
 
 
 # --------------------------------------------------------------------------- 案卷封存（同一抽检多份样本）

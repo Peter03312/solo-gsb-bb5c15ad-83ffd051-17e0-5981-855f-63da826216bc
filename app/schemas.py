@@ -315,3 +315,42 @@ class AliasIn(BaseModel):
 
     alias: str = Field(..., min_length=1, description="待增补的历史别名（全局唯一，不得归属多人或转移）")
     expected_revision: int = Field(..., ge=1, description="所见修订号；与人员当前修订号不一致（过期）则拒绝")
+
+
+class TempConfigIn(BaseModel):
+    """运输测温配置：每份未核定样本一次性设定，设定后不可改。
+
+    * 允许摄氏温度闭区间 [min_celsius, max_celsius]（端点含在内，min ≤ max）；
+    * 最大测温间隔为正数（秒）；同一样本同内容重试幂等，异内容冲突；
+    * 核定入库后拒绝新配置（同内容重试与既有事件接口一致仍幂等返回）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="样本编号")
+    min_celsius: float = Field(..., allow_inf_nan=False, description="允许温度下限（摄氏，闭区间端点）")
+    max_celsius: float = Field(..., allow_inf_nan=False, description="允许温度上限（摄氏，闭区间端点）")
+    max_interval_seconds: int = Field(..., gt=0, description="正数最大测温间隔（秒）")
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> "TempConfigIn":
+        if self.min_celsius > self.max_celsius:
+            raise ValueError("允许温度闭区间下限不得大于上限（min_celsius ≤ max_celsius）")
+        return self
+
+
+class TempReadingIn(BaseModel):
+    """运输测温读数：按全局唯一读数号记录设备号、发生时间与有限数值。
+
+    * 须先完成测温配置；读数发生时间不得早于样本采集时间；
+    * 同一样本同一发生时刻只允许一条读数（重复发生时刻拒绝）；
+    * 同读数号同内容重试幂等返回原记录，异内容冲突；核定后拒绝新读数。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="样本编号")
+    reading_id: str = Field(..., min_length=1, description="全局唯一读数号，同号重试幂等")
+    device_id: str = Field(..., min_length=1, description="测温设备号")
+    occurred_at: datetime = Field(..., description="读数发生时间 ISO8601（不得早于采集时间）")
+    value_celsius: float = Field(..., allow_inf_nan=False, description="摄氏温度读数（有限数值）")

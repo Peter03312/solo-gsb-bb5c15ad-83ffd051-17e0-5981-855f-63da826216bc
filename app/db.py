@@ -196,11 +196,39 @@ CREATE TABLE IF NOT EXISTS person_alias (
     created_at  TEXT NOT NULL
 );
 
+-- 运输测温证据（未核定样本）：每份样本一次性设定允许摄氏温度闭区间与正数最大测温
+-- 间隔（秒），设定后不可改（同内容重试幂等、异内容冲突）；读数按全局唯一读数号记录
+-- 设备号/发生时间/有限数值，采集前、重复发生时刻或同号异内容拒绝，同号同内容重试
+-- 返回原记录。测温配置与读数不参与保管链核验结论、不产生保管链版本；核定后拒绝
+-- 新配置与新读数（同号同内容重试与既有事件接口一致仍幂等返回）。
+CREATE TABLE IF NOT EXISTS sample_temp_config (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id            INTEGER NOT NULL UNIQUE REFERENCES sample(id), -- 一次性设定（每份样本至多一条）
+    min_celsius          REAL NOT NULL,                -- 允许温度闭区间下限（摄氏）
+    max_celsius          REAL NOT NULL,                -- 允许温度闭区间上限（摄氏）
+    max_interval_seconds INTEGER NOT NULL,             -- 正数最大测温间隔（秒）
+    request_hash         TEXT NOT NULL,                -- 配置内容指纹（同内容重试幂等/异内容冲突）
+    created_at           TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS temp_reading (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id     INTEGER NOT NULL REFERENCES sample(id),
+    reading_id    TEXT NOT NULL UNIQUE,              -- 全局唯一读数号
+    device_id     TEXT NOT NULL,                     -- 测温设备号
+    occurred_at   TEXT NOT NULL,                     -- 读数发生时间（UTC ISO8601）
+    value_celsius REAL NOT NULL,                     -- 摄氏温度读数（有限数值）
+    content_hash  TEXT NOT NULL,                     -- 读数内容指纹（同读数号重试比对）
+    created_at    TEXT NOT NULL,
+    UNIQUE (sample_id, occurred_at)                  -- 同一样本同一发生时刻只允许一条读数
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
 CREATE INDEX IF NOT EXISTS idx_review_case_dossier ON review_case(dossier_pk);
 CREATE INDEX IF NOT EXISTS idx_review_opinion_review ON review_opinion(review_pk, item_index);
 CREATE INDEX IF NOT EXISTS idx_person_alias_person ON person_alias(person_pk);
+CREATE INDEX IF NOT EXISTS idx_temp_reading_sample_time ON temp_reading(sample_id, occurred_at, id);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）
