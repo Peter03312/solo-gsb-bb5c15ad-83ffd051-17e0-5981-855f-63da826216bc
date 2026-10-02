@@ -1,0 +1,286 @@
+"""SQLite 连接、建表初始化与底层读写工具。"""
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Iterator
+
+from . import config
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sample (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_code         TEXT NOT NULL UNIQUE,            -- 样本编号（业务唯一）
+    collected_at        TEXT NOT NULL,                   -- 采集时间（UTC ISO8601）
+    collector           TEXT NOT NULL,                   -- 采集人（初始保管人）
+    seal_no             TEXT NOT NULL,                   -- 登记封签号
+    content_hash        TEXT NOT NULL,                   -- 登记内容指纹（幂等/冲突判定）
+    approved_storage_at TEXT,                            -- 入库核定时间；非空即历史锁定
+    approved_by         TEXT,                            -- 核定操作人
+    approve_note        TEXT,                            -- 核定备注
+    created_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS custody_event (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id          INTEGER NOT NULL REFERENCES sample(id),
+    event_id           TEXT NOT NULL UNIQUE,             -- 全局唯一事件号
+    event_type         TEXT NOT NULL CHECK (event_type IN ('transfer','receive','seal_check','storage')),
+    occurred_at        TEXT NOT NULL,                    -- 事件发生时间（UTC ISO8601）
+    payload_json       TEXT NOT NULL,                    -- 类型相关字段
+    content_hash       TEXT NOT NULL,                    -- 事件内容指纹（同事件号重试比对）
+    created_at         TEXT NOT NULL,
+    superseded_by      TEXT,                             -- 被哪条纠错作废/替换（NULL=当前有效版本）
+    replaces_event_id  TEXT,                             -- 替换产生的新事件：指向被替换的原事件号
+    batch_id           TEXT                              -- 批量移交提交时所属批次号（单事件上报为 NULL）
+);
+
+CREATE TABLE IF NOT EXISTS event_correction (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    correction_id     TEXT NOT NULL UNIQUE,              -- 全局唯一纠错号
+    sample_id         INTEGER NOT NULL REFERENCES sample(id),
+    target_event_id   TEXT NOT NULL,                     -- 被纠错的事件号（提交时为当前有效版本）
+    action            TEXT NOT NULL CHECK (action IN ('void','replace')),
+    operator          TEXT NOT NULL,                     -- 纠错操作人
+    reason            TEXT NOT NULL,                     -- 纠错原因
+    new_event_id      TEXT,                              -- replace 时的新事件号（void 为 NULL）
+    new_event_row_id  INTEGER REFERENCES custody_event(id), -- replace 时新事件行
+    request_hash      TEXT NOT NULL,                     -- 纠错请求指纹（同纠错号幂等/冲突判定）
+    created_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transfer_batch (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        TEXT NOT NULL UNIQUE,                -- 全局唯一批次号（同一交接车次一次提交）
+    occurred_at     TEXT NOT NULL,                       -- 统一移交时间（UTC ISO8601）
+    from_custodian  TEXT NOT NULL,                       -- 交出人
+    to_custodian    TEXT NOT NULL,                       -- 接收人
+    item_count      INTEGER NOT NULL,                    -- 批内样本份数
+    request_hash    TEXT NOT NULL,                       -- 整批内容指纹（同批次号幂等/冲突判定）
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transfer_batch_item (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_pk     INTEGER NOT NULL REFERENCES transfer_batch(id),
+    sample_id    INTEGER NOT NULL REFERENCES sample(id),
+    sample_code  TEXT NOT NULL,                          -- 提交时样本编号（批次原始归属留痕）
+    transfer_no  TEXT NOT NULL,                          -- 该份样本移交单号
+    event_id     TEXT NOT NULL,                          -- 该份样本对应的既有 transfer 事件号
+    event_row_id INTEGER NOT NULL REFERENCES custody_event(id),
+    item_index   INTEGER NOT NULL                       -- 提交顺序（0 起）
+);
+
+-- 批量移交到达后的整批对账签收（接收方）：一个批次仅一次成功对账。
+-- 接收方以全局唯一签收单号、签收人与统一签收时间，逐份提交覆盖原批次全部样本的
+-- 对账清单：收妥项落为既有 receive 事件（与各样本新版本同事务提交），
+-- 异常项仅留对账记录、不生成签收事件。失败整单拒绝且不留任何记录。
+CREATE TABLE IF NOT EXISTS batch_reconciliation (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_no TEXT NOT NULL UNIQUE,              -- 全局唯一签收单号（同号重试幂等/异内容冲突）
+    batch_pk          INTEGER NOT NULL UNIQUE REFERENCES transfer_batch(id), -- 一个批次只能成功对账一次
+    receiver          TEXT NOT NULL,                    -- 签收人（须匹配该份在途移交的接收人）
+    occurred_at       TEXT NOT NULL,                     -- 统一签收时间（UTC ISO8601）
+    item_count        INTEGER NOT NULL,                 -- 清单份数（=原批次份数）
+    received_count    INTEGER NOT NULL,                 -- 收妥份数
+    exception_count   INTEGER NOT NULL,                 -- 异常份数
+    request_hash      TEXT NOT NULL,                    -- 对账请求指纹（同签收单号幂等/冲突判定）
+    created_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batch_reconciliation_item (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    reconciliation_pk INTEGER NOT NULL REFERENCES batch_reconciliation(id),
+    batch_item_pk     INTEGER NOT NULL REFERENCES transfer_batch_item(id),
+    item_index        INTEGER NOT NULL,                 -- 原批次明细顺序（0 起，按原批次顺序呈现）
+    sample_id         INTEGER NOT NULL REFERENCES sample(id),
+    sample_code       TEXT NOT NULL,                    -- 提交时样本编号（原始归属留痕）
+    transfer_no       TEXT NOT NULL,                    -- 原批次该份移交单号（留痕，不改写）
+    outcome           TEXT NOT NULL CHECK (outcome IN ('received','exception')),
+    event_id          TEXT,                             -- 收妥项生成的既有 receive 事件号（异常项为 NULL）
+    event_row_id      INTEGER REFERENCES custody_event(id), -- 收妥项 receive 事件行
+    verified_seal_no  TEXT,                             -- 收妥项实核封签号（异常项为 NULL）
+    reason            TEXT,                             -- 异常项原因（收妥项为 NULL）
+    UNIQUE (reconciliation_pk, sample_code)
+);
+
+-- 样本保管链版本（质控复核用）：版本 0 为登记/升级基线快照，此后每次真正提交
+-- （单事件、批量移交中该样本事件、作废/替换纠错、入库核定）追加一个不可变快照行。
+-- 版本按提交先后（id/created_at）排列，补录事件的较早发生时间不改写旧版。
+CREATE TABLE IF NOT EXISTS sample_version (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id     INTEGER NOT NULL REFERENCES sample(id),
+    version       INTEGER NOT NULL,                     -- 样本内版本号，从 0 起严格递增
+    change_type   TEXT NOT NULL CHECK (change_type IN
+                    ('register','event','batch_transfer','correction','approval','baseline')),
+    change_ref    TEXT,                                 -- 触发版本的业务号（事件号/批次号/纠错号；register/baseline 为 NULL）
+    snapshot_json TEXT NOT NULL,                        -- 提交时点完整核验快照（结论/原因/保管人/时间线/纠错/核定）
+    created_at    TEXT NOT NULL,
+    UNIQUE (sample_id, version)
+);
+
+-- 案卷封存（质控）：同一抽检的多份样本保管链版本一次封存为不可变案卷。
+-- 案卷永久保存所选版本的完整快照与按样本编号排序的清单，并持有可复算的
+-- SHA-256 摘要；后续补录/纠错/核定不改变旧案卷。
+CREATE TABLE IF NOT EXISTS dossier (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id    TEXT NOT NULL UNIQUE,                -- 全局唯一案卷号
+    item_count    INTEGER NOT NULL,                    -- 卷内样本份数（>=2）
+    digest        TEXT NOT NULL,                       -- 封存内容 SHA-256 摘要（可复算）
+    request_hash  TEXT NOT NULL,                       -- 封存请求指纹（同案卷号幂等/冲突判定）
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dossier_item (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_pk    INTEGER NOT NULL REFERENCES dossier(id),
+    sample_id     INTEGER NOT NULL REFERENCES sample(id),
+    sample_code   TEXT NOT NULL,                       -- 封存时样本编号（清单留痕）
+    version       INTEGER NOT NULL,                    -- 封存时选取的版本号（非负）
+    item_index    INTEGER NOT NULL,                    -- 按样本编号排序后的序号（0 起）
+    snapshot_json TEXT NOT NULL,                       -- 所选版本完整快照（永久保存）
+    UNIQUE (dossier_pk, sample_code)
+);
+
+-- 案卷双人独立复核（质控）：一个案卷对应一个复核案；前两份为两名不同复核人的
+-- 完整清单（seq 1/2，kind=review），有分歧的份项再由未参与前两次复核的第三人
+-- 裁决（seq 3，kind=adjudication，仅含分歧份项）。意见提交后不可改。
+CREATE TABLE IF NOT EXISTS review_case (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_pk    INTEGER NOT NULL UNIQUE REFERENCES dossier(id),
+    digest        TEXT NOT NULL,                       -- 首次提交时核对的案卷摘要副本
+    final_json    TEXT,                                -- 案卷终局结论（全部份项终局后固化，null=未终局）
+    finalized_at  TEXT,                                -- 案卷结论形成时间（UTC ISO8601）
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_pk       INTEGER NOT NULL REFERENCES review_case(id),
+    review_no     TEXT NOT NULL UNIQUE,                -- 全局唯一复核单号（同号重试幂等/异内容冲突）
+    seq           INTEGER NOT NULL,                    -- 提交次序：1/2 独立复核，3 第三人裁决
+    kind          TEXT NOT NULL CHECK (kind IN ('review','adjudication')),
+    reviewer      TEXT NOT NULL,                       -- 复核人标识（前两份须不同，第三人须未参与前两次）
+    reviewer_person_id TEXT,                           -- 提交时解析的人员标识归属（NULL=未登记/升级前旧意见，不伪造）
+    request_hash  TEXT NOT NULL,                       -- 请求指纹（同复核单号幂等/冲突判定）
+    created_at    TEXT NOT NULL,
+    UNIQUE (case_pk, seq),
+    UNIQUE (case_pk, reviewer)                         -- 复核人在同一案卷内不得重复（前两名互异、第三人未参与前两次）
+);
+
+CREATE TABLE IF NOT EXISTS review_opinion (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_pk        INTEGER NOT NULL REFERENCES review(id),
+    dossier_item_pk  INTEGER NOT NULL REFERENCES dossier_item(id),
+    sample_code      TEXT NOT NULL,                    -- 卷内样本编号（须命中封存清单）
+    item_index       INTEGER NOT NULL,                 -- 封存清单序号（0 起，按样本编号排序）
+    passed           INTEGER NOT NULL,                 -- 该份结论：1=通过，0=不通过
+    reason           TEXT,                             -- 不通过原因（通过为 NULL）
+    UNIQUE (review_pk, sample_code)
+);
+
+-- 人员标识与历史别名（质控复核回避）：人员以全局唯一主标识登记，可登记/增补
+-- 历史别名；主标识与全部别名构成全局唯一命名空间——别名不得归属多人、不得
+-- 转移归属（不提供删除/转移）。增补别名须携带所见修订号（过期拒绝）。
+CREATE TABLE IF NOT EXISTS person (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id     TEXT NOT NULL UNIQUE,                -- 人员标识（主标识，全局唯一）
+    revision      INTEGER NOT NULL,                    -- 修订号：登记为 1，每次成功增补别名 +1
+    request_hash  TEXT NOT NULL,                       -- 登记请求指纹（同标识幂等/冲突判定）
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_alias (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_pk   INTEGER NOT NULL REFERENCES person(id),
+    alias       TEXT NOT NULL UNIQUE,                  -- 别名全局唯一：不得归属多人、不得转移
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
+CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
+CREATE INDEX IF NOT EXISTS idx_review_case_dossier ON review_case(dossier_pk);
+CREATE INDEX IF NOT EXISTS idx_review_opinion_review ON review_opinion(review_pk, item_index);
+CREATE INDEX IF NOT EXISTS idx_person_alias_person ON person_alias(person_pk);
+"""
+
+# 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）
+POST_MIGRATION_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_event_effective ON custody_event(sample_id, superseded_by, occurred_at)",
+    "CREATE INDEX IF NOT EXISTS idx_correction_sample ON event_correction(sample_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_event_batch ON custody_event(batch_id)",
+    "CREATE INDEX IF NOT EXISTS idx_batch_item_batch ON transfer_batch_item(batch_pk, item_index)",
+    "CREATE INDEX IF NOT EXISTS idx_dossier_item_dossier ON dossier_item(dossier_pk, item_index)",
+    "CREATE INDEX IF NOT EXISTS idx_recon_item_recon ON batch_reconciliation_item(reconciliation_pk, item_index)",
+]
+
+# 旧库增量补列
+_MIGRATION_COLUMNS = {
+    "custody_event": [
+        ("superseded_by", "TEXT"),
+        ("replaces_event_id", "TEXT"),
+        ("batch_id", "TEXT"),
+    ],
+    "review": [
+        ("reviewer_person_id", "TEXT"),                # 升级前旧意见保持 NULL，不伪造身份记录
+    ],
+}
+
+
+def utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def get_connection() -> sqlite3.Connection:
+    config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(config.DB_PATH), timeout=config.DB_TIMEOUT)
+    conn.row_factory = sqlite3.Row
+    # WAL 提升读写并发，遇到锁立即报错由服务层转 409
+    conn.execute("PRAGMA journal_mode=WAL");
+    conn.execute("PRAGMA foreign_keys=ON");
+    conn.execute("PRAGMA busy_timeout=%d" % int(config.DB_TIMEOUT * 1000))
+    return conn
+
+
+@contextmanager
+def db_session(commit: bool = True, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+    """事务上下文。
+
+    immediate=True 时以 BEGIN IMMEDIATE 开启，事务一开始即持有写锁，
+    使所有写操作（事件上报 / 纠错 / 核定）在 SQLite 层严格串行：
+    纠错与核定并发时后到者必然看到先到者已提交的最终状态。
+    """
+    conn = get_connection()
+    if immediate:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        if commit:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db() -> None:
+    """进程启动时建表（幂等），并对旧库执行增量迁移。"""
+    with db_session() as conn:
+        conn.executescript(SCHEMA)
+        for table, columns in _MIGRATION_COLUMNS.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        for stmt in POST_MIGRATION_INDEXES:
+            conn.execute(stmt)
+    # 升级前已有样本：以升级时状态补建版本 0 基线（不推断更早历史）。
+    # 惰性导入避免 db ↔ service 的模块级循环依赖。
+    from .versions import ensure_version_baselines
+
+    with db_session(immediate=True) as conn:
+        ensure_version_baselines(conn)
+
+
+def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row is not None else None
