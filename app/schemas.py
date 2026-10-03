@@ -1,4 +1,5 @@
 """HTTP 请求体的 Pydantic 模型与按事件类型的必填字段校验。"""
+import math
 from datetime import datetime
 from typing import Literal
 
@@ -315,3 +316,105 @@ class AliasIn(BaseModel):
 
     alias: str = Field(..., min_length=1, description="待增补的历史别名（全局唯一，不得归属多人或转移）")
     expected_revision: int = Field(..., ge=1, description="所见修订号；与人员当前修订号不一致（过期）则拒绝")
+
+
+# ===========================================================================
+# 运输测温复核
+# ===========================================================================
+
+
+class TemperatureConfigIn(BaseModel):
+    """每份未核定样本一次性设定的运输测温配置。
+
+    * 允许摄氏温度闭区间 [min_celsius, max_celsius]（下限不大于上限，均为有限数）；
+    * 最大测温间隔为正数（秒）；
+    * 配置一次性生效：同内容重试幂等（200），异内容冲突（409）；
+    * 样本核定入库后拒绝新配置（409 history_locked）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    min_celsius: float = Field(..., description="允许温度闭区间下限（℃，有限数）")
+    max_celsius: float = Field(..., description="允许温度闭区间上限（℃，有限数）")
+    max_interval_seconds: int = Field(..., strict=True, gt=0, description="正数最大测温间隔（秒）")
+
+    @model_validator(mode="after")
+    def _check_range(self) -> "TemperatureConfigIn":
+        if not (math.isfinite(self.min_celsius) and math.isfinite(self.max_celsius)):
+            raise ValueError("温度限值必须为有限数值（不接受 NaN/Infinity）")
+        if self.min_celsius > self.max_celsius:
+            raise ValueError(
+                f"允许温度闭区间下限不得大于上限：{self.min_celsius} > {self.max_celsius}"
+            )
+        return self
+
+
+class TemperatureReadingIn(BaseModel):
+    """测温读数上报：全局唯一读数号 + 设备号 + 发生时间 + 有限摄氏数值。
+
+    * 发生时间不得早于样本采集时间（采集前拒绝）；
+    * 同读数号同内容重试幂等返回原记录（200），同号异内容冲突（409）；
+    * 读数可乱序补录，查询按发生时间重算；
+    * 样本核定入库后拒绝新读数（409 history_locked）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reading_id: str = Field(..., min_length=1, description="全局唯一读数号，同号重试幂等")
+    device_id: str = Field(..., min_length=1, description="测温设备号")
+    occurred_at: datetime = Field(..., description="读数发生时间 ISO8601（不得早于采集时间）")
+    celsius: float = Field(..., description="摄氏温度数值（有限数；NaN/Infinity 拒绝）")
+
+    @model_validator(mode="after")
+    def _check_finite(self) -> "TemperatureReadingIn":
+        if not math.isfinite(self.celsius):
+            raise ValueError("测温数值必须为有限数值（不接受 NaN/Infinity）")
+        return self
+
+
+class NewTemperatureReadingIn(BaseModel):
+    """测温读数替换纠错时提交的完整新读数内容（不含读数号以外的样本归属——纠错不得跨样本）。
+
+    新读数号必须全局未被占用（旧号永久留痕不可复用）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    reading_id: str = Field(..., min_length=1, description="新读数号，必须未被占用（全局唯一）")
+    device_id: str = Field(..., min_length=1, description="测温设备号")
+    occurred_at: datetime = Field(..., description="读数发生时间 ISO8601（不得早于采集时间）")
+    celsius: float = Field(..., description="摄氏温度数值（有限数）")
+
+    @model_validator(mode="after")
+    def _check_finite(self) -> "NewTemperatureReadingIn":
+        if not math.isfinite(self.celsius):
+            raise ValueError("测温数值必须为有限数值（不接受 NaN/Infinity）")
+        return self
+
+
+class TemperatureCorrectionIn(BaseModel):
+    """测温读数纠错：作废（void）或替换（replace）。
+
+    * 仅样本核定入库前、且目标为当前有效读数时可提交；不得跨样本；
+    * 同一纠错号同内容重试幂等（200），异内容冲突（409）；
+    * replace 必须给出完整新读数内容与未占用的新读数号；void 不得携带新读数；
+    * 原始读数与旧纠错记录永不改写，归属在纠错后按当前有效读数重算。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    correction_id: str = Field(..., min_length=1, description="全局唯一测温纠错号，同号重试幂等")
+    sample_code: str = Field(..., min_length=1, description="样本编号（纠错不得跨样本）")
+    target_reading_id: str = Field(..., min_length=1, description="被作废/替换的当前有效读数号")
+    action: CorrectionAction = Field(..., description="void=作废，replace=替换")
+    operator: str = Field(..., min_length=1, description="纠错操作人")
+    reason: str = Field(..., min_length=1, description="纠错原因")
+    new_reading: NewTemperatureReadingIn | None = Field(None, description="替换时的完整新读数内容；作废时必须为空")
+
+    @model_validator(mode="after")
+    def _check_action_payload(self) -> "TemperatureCorrectionIn":
+        if self.action == "replace" and self.new_reading is None:
+            raise ValueError("action=replace 必须提供 new_reading（完整新读数内容与未占用的新读数号）")
+        if self.action == "void" and self.new_reading is not None:
+            raise ValueError("action=void 作废不得携带 new_reading")
+        return self

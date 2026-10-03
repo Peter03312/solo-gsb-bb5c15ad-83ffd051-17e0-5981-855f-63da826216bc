@@ -196,6 +196,51 @@ CREATE TABLE IF NOT EXISTS person_alias (
     created_at  TEXT NOT NULL
 );
 
+-- 运输测温复核：每份未核定样本一次性设定允许摄氏温度闭区间与正数最大测温间隔。
+-- 配置一次性写入：同内容重试幂等，异内容冲突；核定后拒绝新配置。
+CREATE TABLE IF NOT EXISTS temperature_config (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id            INTEGER NOT NULL UNIQUE REFERENCES sample(id),
+    sample_code          TEXT NOT NULL,                       -- 设定时样本编号（留痕）
+    min_celsius          REAL NOT NULL,                       -- 允许温度闭区间下限（℃）
+    max_celsius          REAL NOT NULL,                       -- 允许温度闭区间上限（℃）
+    max_interval_seconds INTEGER NOT NULL,                    -- 正数最大测温间隔（秒）
+    request_hash         TEXT NOT NULL,                       -- 配置指纹（同内容幂等/异内容冲突）
+    created_at           TEXT NOT NULL
+);
+
+-- 测温读数：按全局唯一读数号记录设备号、发生时间与有限数值。
+-- 读数可乱序补录，查询按发生时间重算；作废/替换纠错仅把原行标记失效
+-- （superseded_by），原始读数与旧纠错记录永不改写、不删除。
+CREATE TABLE IF NOT EXISTS temperature_reading (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_id             INTEGER NOT NULL REFERENCES sample(id),
+    reading_id            TEXT NOT NULL UNIQUE,               -- 全局唯一读数号（同号重试幂等/异内容冲突）
+    device_id             TEXT NOT NULL,                      -- 测温设备号
+    occurred_at           TEXT NOT NULL,                      -- 读数发生时间（UTC ISO8601，不得早于采集时间）
+    celsius               REAL NOT NULL,                      -- 有限摄氏温度数值
+    content_hash          TEXT NOT NULL,                      -- 读数内容指纹
+    created_at            TEXT NOT NULL,
+    superseded_by         TEXT,                               -- 被哪条测温纠错作废/替换（NULL=当前有效）
+    replaces_reading_id   TEXT                                -- 替换产生的新读数：指向原读数号
+);
+
+-- 测温读数纠错（作废/替换）：仅核定前可提交，只作用于当前有效读数；
+-- 与保管链事件纠错相互独立，不改动原始读数，也不产生保管链版本。
+CREATE TABLE IF NOT EXISTS temperature_correction (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    correction_id      TEXT NOT NULL UNIQUE,                 -- 全局唯一测温纠错号
+    sample_id          INTEGER NOT NULL REFERENCES sample(id),
+    target_reading_id  TEXT NOT NULL,                        -- 被纠错读数号（提交时为当前有效版本）
+    action             TEXT NOT NULL CHECK (action IN ('void','replace')),
+    operator           TEXT NOT NULL,
+    reason             TEXT NOT NULL,
+    new_reading_id     TEXT,                                 -- replace 时的新读数号（void 为 NULL）
+    new_reading_row_id INTEGER REFERENCES temperature_reading(id),
+    request_hash       TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
 CREATE INDEX IF NOT EXISTS idx_review_case_dossier ON review_case(dossier_pk);
@@ -211,6 +256,8 @@ POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_batch_item_batch ON transfer_batch_item(batch_pk, item_index)",
     "CREATE INDEX IF NOT EXISTS idx_dossier_item_dossier ON dossier_item(dossier_pk, item_index)",
     "CREATE INDEX IF NOT EXISTS idx_recon_item_recon ON batch_reconciliation_item(reconciliation_pk, item_index)",
+    "CREATE INDEX IF NOT EXISTS idx_temp_reading_sample ON temperature_reading(sample_id, superseded_by, occurred_at)",
+    "CREATE INDEX IF NOT EXISTS idx_temp_correction_sample ON temperature_correction(sample_id, id)",
 ]
 
 # 旧库增量补列

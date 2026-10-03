@@ -637,6 +637,83 @@ def main() -> None:
     print(f"\n--- 人员查询 [HTTP {s}] ---")
     print(json.dumps(r["person"], ensure_ascii=False, indent=2))
 
+    # 17) 运输测温复核（温度配置 → 读数 → 超温/缺测分段归属 → 纠错重算）
+    print("\n=== 运输测温复核 ===")
+    tcode = f"API-TEMP-{run_id}"
+    call("POST", "/samples", {
+        "sample_code": tcode,
+        "collected_at": "2026-09-30T01:00:00Z",
+        "collector": "王采集",
+        "seal_no": "SEAL-T1",
+    })
+    # 保管链：02:00 移交在途（王采集→李运输），04:00 李运输签收，05:00 入库
+    call("POST", "/events", {
+        "event_id": f"API-TT1-{run_id}", "event_type": "transfer", "sample_code": tcode,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": "TR-T1", "from_custodian": "王采集", "to_custodian": "李运输"})
+    call("POST", "/events", {
+        "event_id": f"API-TR1-{run_id}", "event_type": "receive", "sample_code": tcode,
+        "occurred_at": "2026-09-30T04:00:00Z",
+        "transfer_no": "TR-T1", "receiver": "李运输", "seal_no": "SEAL-T1"})
+    call("POST", "/events", {
+        "event_id": f"API-TS1-{run_id}", "event_type": "storage", "sample_code": tcode,
+        "occurred_at": "2026-09-30T05:00:00Z", "custodian": "实验室"})
+
+    # 17.1) 一次性测温配置：允许 2~8℃ 闭区间，最大测温间隔 1 小时
+    s, r = call("PUT", f"/samples/{tcode}/temperature-config",
+                {"min_celsius": 2, "max_celsius": 8, "max_interval_seconds": 3600})
+    show("一次性测温配置", s, r)
+    s, r = call("PUT", f"/samples/{tcode}/temperature-config",
+                {"min_celsius": 2, "max_celsius": 9, "max_interval_seconds": 3600})
+    print("改配置（一次性，异内容）:", s, r.get("error", {}).get("code"))
+
+    # 17.2) 读数上报（乱序补录；支持同号幂等/异内容冲突；采集前拒绝）
+    call("POST", f"/samples/{tcode}/temperature-readings",
+         {"reading_id": f"API-T-R01-{run_id}", "device_id": "TEMPLOGGER-7",
+          "occurred_at": "2026-09-30T01:00:00Z", "celsius": 5.0})
+    call("POST", f"/samples/{tcode}/temperature-readings",
+         {"reading_id": f"API-T-R03-{run_id}", "device_id": "TEMPLOGGER-7",
+          "occurred_at": "2026-09-30T03:00:00Z", "celsius": 9.4})     # 超温（在途段）
+    call("POST", f"/samples/{tcode}/temperature-readings",
+         {"reading_id": f"API-T-R04-{run_id}", "device_id": "TEMPLOGGER-7",
+          "occurred_at": "2026-09-30T04:40:00Z", "celsius": 5.1})
+    call("POST", f"/samples/{tcode}/temperature-readings",
+         {"reading_id": f"API-T-R05-{run_id}", "device_id": "TEMPLOGGER-7",
+          "occurred_at": "2026-09-30T06:00:00Z", "celsius": 5.0})
+    s, r = call("POST", f"/samples/{tcode}/temperature-readings",
+                {"reading_id": f"API-T-PRE-{run_id}", "device_id": "TEMPLOGGER-7",
+                 "occurred_at": "2026-09-30T00:30:00Z", "celsius": 5.0})
+    print("采集前读数:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", f"/samples/{tcode}/temperature-readings",
+                {"reading_id": f"API-T-R01-{run_id}", "device_id": "TEMPLOGGER-7",
+                 "occurred_at": "2026-09-30T01:00:00Z", "celsius": 5.0})
+    print("同号同内容重试:", s, "idempotent =", r.get("idempotent"))
+
+    # 17.3) 测温复核报告：超温点 + 跨移交/签收时刻拆分的缺测区间及逐段归属
+    s, r = call("GET", f"/samples/{tcode}/temperature-report")
+    rep = r["report"]
+    print(f"\n--- 测温复核报告 [HTTP {s}] 超温 {rep['excursion_count']} 处、缺测 {rep['gap_count']} 段 ---")
+    for e in rep["excursions"]:
+        print(f"  超温: {e['occurred_at']} {e['celsius']}℃ ({e['direction']}) 归属={e['custody']['attribution']}")
+    for g in rep["gaps"]:
+        print(f"  缺测: {g['start_at']} → {g['end_at']}（{g['duration_seconds']}s，超限 {g['exceeds_by_seconds']}s）")
+        for seg in g["segments"]:
+            c_desc = (seg["custody"].get("custodian")
+                      or f"在途 {seg['custody'].get('from_custodian')}→{seg['custody'].get('to_custodian')}"
+                      or seg["custody"].get("attribution"))
+            print(f"      分段 {seg['start_at']} → {seg['end_at']}（{seg['duration_seconds']}s）{c_desc}")
+
+    # 17.4) 读数纠错：把误录的 9.4℃ 替换为 5.4℃（原始读数留痕，归属重算）
+    s, r = call("POST", "/temperature-corrections", {
+        "correction_id": f"API-TFIX1-{run_id}", "sample_code": tcode,
+        "target_reading_id": f"API-T-R03-{run_id}", "action": "replace",
+        "operator": "质控员", "reason": "设备导出小数点错误，9.4 应为 5.4",
+        "new_reading": {"reading_id": f"API-T-R03B-{run_id}", "device_id": "TEMPLOGGER-7",
+                        "occurred_at": "2026-09-30T03:00:00Z", "celsius": 5.4}})
+    print("\n替换纠错:", s, "纠错后超温数 =", r.get("report", {}).get("excursion_count"))
+    s, r = call("GET", f"/samples/{tcode}/temperature-readings")
+    print(f"读数列表 [HTTP {s}] 总数={r['total']} 有效={r['effective']}（被替换原读数仍留痕、effective=false）")
+
 
 if __name__ == "__main__":
     main()

@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import config
@@ -22,6 +23,9 @@ from .schemas import (
     PersonIn,
     ReviewIn,
     SampleIn,
+    TemperatureConfigIn,
+    TemperatureCorrectionIn,
+    TemperatureReadingIn,
     TransferBatchIn,
 )
 from .service import (
@@ -36,6 +40,16 @@ from .service import (
     register_sample,
     submit_correction,
     submit_transfer_batch,
+)
+from .temperature import (
+    add_reading,
+    build_report,
+    config_to_dict,
+    get_config_row,
+    list_readings,
+    list_temperature_corrections,
+    set_temperature_config,
+    submit_temperature_correction,
 )
 from .versions import get_version, latest_version_no, list_versions, parse_version
 
@@ -58,8 +72,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="样本交接链核验服务",
-    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核与人员标识复核回避",
-    version="1.7.0",
+    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避与运输测温复核",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -67,6 +81,26 @@ app = FastAPI(
 @app.exception_handler(DomainError)
 async def domain_error_handler(request: Request, exc: DomainError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"error": {"code": exc.code, "message": exc.message, "details": exc.details}})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """请求体字段校验失败统一为 422 validation_error。
+
+    逐字段给出 loc/msg；不回显原始输入值——测温值可能为 NaN/Infinity，
+    回显会使 JSON 响应本身不可序列化（且无必要把非法值再返回给调用方）。
+    """
+    items = [
+        {"field": ".".join(str(p) for p in err.get("loc", []) if p != "body"),
+         "message": err.get("msg", "")}
+        for err in exc.errors()
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "validation_error",
+                           "message": "请求参数校验失败（字段缺失/类型不符/取值非法）",
+                           "details": {"items": items}}},
+    )
 
 
 def _summary(result: dict[str, Any], sample: dict[str, Any], conn=None) -> dict[str, Any]:
@@ -292,6 +326,91 @@ def approve_api(sample_code: str, data: ApproveIn) -> dict[str, Any]:
         result = approve_storage(conn, sample_code, data)
         sample = get_sample_or_404(conn, sample_code)
         return {"evaluation": _summary(result, dict(sample), conn), "approval": result["approval"]}
+
+
+# --------------------------------------------------------------------------- 运输测温复核
+
+@app.put(f"{API_PREFIX}/samples/{{sample_code}}/temperature-config", tags=["temperature"])
+def set_temperature_config_api(sample_code: str, data: TemperatureConfigIn) -> JSONResponse:
+    """一次性设定样本运输测温配置：允许摄氏温度闭区间 + 正数最大测温间隔（秒）。
+
+    * 同内容重试 → 200 幂等；配置已存在且异内容 → 409 temp_config_conflict；
+    * 样本已核定入库 → 409 history_locked（拒绝新配置）；样本不存在 → 404。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = set_temperature_config(conn, sample_code, data)
+    body["idempotent"] = idempotent
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature-config", tags=["temperature"])
+def get_temperature_config_api(sample_code: str) -> dict[str, Any]:
+    """查询样本的一次性测温配置；尚未设定 → 404 temp_config_not_found。"""
+    with db_session() as conn:
+        sample = get_sample_or_404(conn, sample_code)
+        row = get_config_row(conn, sample["id"])
+        if row is None:
+            raise DomainError(
+                404, "temp_config_not_found",
+                f"样本 {sample_code} 尚未设定测温配置", {"sample_code": sample_code},
+            )
+        return {"config": config_to_dict(row)}
+
+
+@app.post(f"{API_PREFIX}/samples/{{sample_code}}/temperature-readings", tags=["temperature"], status_code=201)
+def add_temperature_reading_api(sample_code: str, data: TemperatureReadingIn) -> JSONResponse:
+    """记录测温读数：全局唯一读数号、设备号、发生时间、有限摄氏数值。
+
+    * 发生时间早于采集 → 422 reading_before_collection；
+    * 同读数号同内容重试 → 200 返回原记录；同号异内容 → 409 temp_reading_conflict；
+    * 尚未配置测温 → 422 temp_config_required；样本已核定 → 409 history_locked；
+    * 支持乱序补录，查询按发生时间重算。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = add_reading(conn, sample_code, data)
+    body["idempotent"] = idempotent
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature-readings", tags=["temperature"])
+def list_temperature_readings_api(sample_code: str) -> dict[str, Any]:
+    """样本全部测温读数（含作废留痕），按发生时间排列。"""
+    with db_session() as conn:
+        return list_readings(conn, sample_code)
+
+
+@app.post(f"{API_PREFIX}/temperature-corrections", tags=["temperature"], status_code=201)
+def submit_temperature_correction_api(data: TemperatureCorrectionIn) -> JSONResponse:
+    """测温读数纠错（核定前）：作废 void / 替换 replace，永久留痕、原始读数不改。
+
+    * 同纠错号同内容重试 → 200 幂等（带重算报告）；异内容 → 409 temp_correction_conflict；
+    * 目标读数不存在 → 404 temp_reading_not_found；跨样本 → 409 temp_correction_cross_sample；
+    * 目标已被作废/替换 → 409 reading_not_effective；新读数号占用 → 409 new_reading_id_occupied；
+    * 样本已核定 → 409 history_locked；纠错后归属按当前有效保管链与有效读数重算。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = submit_temperature_correction(conn, data)
+    body["idempotent"] = idempotent
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature-corrections", tags=["temperature"])
+def list_temperature_corrections_api(sample_code: str) -> dict[str, Any]:
+    """样本测温读数纠错审计记录（永久留痕）。"""
+    with db_session() as conn:
+        return list_temperature_corrections(conn, sample_code)
+
+
+@app.get(f"{API_PREFIX}/samples/{{sample_code}}/temperature-report", tags=["temperature"])
+def temperature_report_api(sample_code: str) -> dict[str, Any]:
+    """测温复核报告：按发生时间列超温点与超阈缺测区间（跨移交/签收时刻拆分，
+    逐段标明当时保管人 custody / 在途 in_transit / 断链待核 pending_verify）。
+
+    依当前有效保管链与当前有效读数实时重算（乱序补录、移交/签收纠错后自动反映）；
+    尚未配置测温 → 404 temp_config_not_found。
+    """
+    with db_session() as conn:
+        return {"report": build_report(conn, sample_code)}
 
 
 # --------------------------------------------------------------------------- 案卷封存（同一抽检多份样本）
